@@ -39,6 +39,26 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self.rl_agent = account_name_one
         self._prev_battle_state = {}
 
+    def reset(self, seed=None, options=None):
+        # poke_env's Player._battles dict keeps every finished battle
+        # forever -- poke_env only clears it via env.close(purge=True),
+        # which nothing in the training loop ever calls. Over a long
+        # training run (thousands of episodes) this accumulates several
+        # GB of retained AbstractBattle history that nothing here needs:
+        # calc_reward/embed_battle receive the live battle object
+        # directly, and _get_prior_battle compares against separately
+        # deepcopy'd snapshots, not this dict. Safe to purge every reset,
+        # since only already-finished battles are in it at this point
+        # (the new episode's battle doesn't exist until super().reset()
+        # below creates it).
+        try:
+            self.agent1.reset_battles()
+            self.agent2.reset_battles()
+        except EnvironmentError:
+            pass  # a battle wasn't marked finished yet -- skip this cycle
+
+        return super().reset(seed, options)
+
     # =========================================================
     # Action space
     # =========================================================
