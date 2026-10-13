@@ -62,10 +62,32 @@ class ShowdownEnvironment(BaseShowdownEnv):
     # =========================================================
     # Action space
     # =========================================================
+    # poke_env's default 26-action mapping reserves action indices 10-21
+    # for "move + mega-evolve / z-move / dynamax" combos (num_gimmicks=4 in
+    # SinglesEnv.__init__ for any gen9 format). None of those three
+    # mechanics exist in Gen9 Ubers (Dynamax was removed after Gen8,
+    # Mega Evolution and Z-Moves after Gen7) -- battle.can_mega_evolve,
+    # battle.can_z_move, and battle.can_dynamax are permanently False for
+    # every battle this agent ever plays. Those 12 indices (46% of the
+    # action space) are therefore *always* illegal: action_to_order's
+    # strict=False fallback silently rewrites them to "/choose default"
+    # (SinglesEnv is constructed with strict=False in BaseShowdownEnv),
+    # which executes a different move than the one the network selected.
+    # That corrupts the (state, action, reward) tuple stored in the replay
+    # buffer -- the TD update's q_value(s, a) target is built from a reward
+    # that didn't actually come from a. Trimming the network's action
+    # space to the 14 indices that can ever be legal (6 switches + 4 moves
+    # + 4 move+terastallize, skipping the dead mega/z-move/dynamax block)
+    # removes this corruption at the source instead of hoping the network
+    # learns the dead zone purely from reward signal.
     def _get_action_size(self) -> int | None:
-        return None  # default 26-action mapping used by CARES
+        return 14
 
     def process_action(self, action: np.int64) -> np.int64:
+        # 0-5: switch, 6-9: move (unchanged). 10-13 (our trimmed space's
+        # "move + terastallize") map to the real action space's 22-25.
+        if action >= 10:
+            return np.int64(action + 12)
         return action
 
     # =========================================================
@@ -117,14 +139,29 @@ class ShowdownEnvironment(BaseShowdownEnv):
           4x type multipliers
           2x (ally_fainted/6, opp_fainted/6)
           2x (ally_total_hp, opp_total_hp)
-        = 12 features
+          1x ally_faster (base speed comparison)
+          2x (ally_active_has_status, opp_active_has_status)
+          3x (best_switch_offense, best_switch_defense, bench_alive_frac)
+        = 18 features
+
+        The last 6 features exist because the action space includes
+        switching (indices 0-5), but nothing in the original 12-feature
+        state described the *bench* -- the network could select a switch
+        action but had no information to judge which of its other 5 team
+        members would be a good matchup, or whether switching is even
+        attractive right now (ally_faster/status). Added as bounded
+        aggregates (max/min pooling over bench Pokemon) rather than
+        per-slot features, since team order isn't semantically meaningful
+        across battles and this keeps the feature count fixed regardless
+        of how many bench members are still alive.
         """
-        return 12
+        return 18
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
         """
         SB3-style compact embedding of the battle state.
-        Combines per-move offensive info with overall HP context.
+        Combines per-move offensive info with overall HP context and
+        switch-relevant bench information.
         """
         obs = np.zeros(self._observation_size(), dtype=np.float32)
 
@@ -154,10 +191,62 @@ class ShowdownEnvironment(BaseShowdownEnv):
         ally_fainted = len([m for m in battle.team.values() if m.fainted]) / 6.0
         opp_fainted = len([m for m in battle.opponent_team.values() if m.fainted]) / 6.0
 
+        try:
+            ally_faster = float(active.base_stats["spe"] > opp.base_stats["spe"])
+        except Exception:
+            ally_faster = 0.5
+
+        ally_has_status = float(active.status is not None)
+        opp_has_status = float(opp.status is not None)
+
+        bench = [m for m in battle.team.values() if m is not active and not m.fainted]
+        best_switch_offense = 0.0
+        best_switch_defense = 1.0  # 1.0 = neutral; lower found below = safer
+        if bench:
+            offense_scores = []
+            defense_scores = []
+            for mon in bench:
+                try:
+                    off = mon.type_1.damage_multiplier(
+                        opp.type_1, getattr(opp, "type_2", None),
+                        type_chart=GEN_DATA.type_chart,
+                    )
+                    if mon.type_2 is not None:
+                        off = max(off, mon.type_2.damage_multiplier(
+                            opp.type_1, getattr(opp, "type_2", None),
+                            type_chart=GEN_DATA.type_chart,
+                        ))
+                    offense_scores.append(off)
+                except Exception:
+                    pass
+                try:
+                    dfn = opp.type_1.damage_multiplier(
+                        mon.type_1, mon.type_2, type_chart=GEN_DATA.type_chart,
+                    )
+                    if opp.type_2 is not None:
+                        dfn = max(dfn, opp.type_2.damage_multiplier(
+                            mon.type_1, mon.type_2, type_chart=GEN_DATA.type_chart,
+                        ))
+                    defense_scores.append(dfn)
+                except Exception:
+                    pass
+            if offense_scores:
+                best_switch_offense = max(offense_scores)
+            if defense_scores:
+                best_switch_defense = min(defense_scores)
+
+        bench_alive_frac = len(bench) / 5.0
+
         obs = np.concatenate([
             moves_base_power,
             moves_dmg_multiplier,
-            np.array([ally_fainted, opp_fainted, ally_hp_total, opp_hp_total], dtype=np.float32),
+            np.array([
+                ally_fainted, opp_fainted, ally_hp_total, opp_hp_total,
+                ally_faster, ally_has_status, opp_has_status,
+                min(best_switch_offense / 4.0, 1.0),
+                min(best_switch_defense / 4.0, 1.0),
+                bench_alive_frac,
+            ], dtype=np.float32),
         ])
 
         return obs.astype(np.float32)
