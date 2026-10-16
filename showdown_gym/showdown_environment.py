@@ -97,16 +97,23 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         Reward based on HP, fainted Pokémon, and victory outcomes.
         Inspired by SimpleRLPlayer reward_computing_helper.
+
+        hp_delta is a potential-based shaping term (Ng, Harada & Russell,
+        1999): Phi(s) = ally_hp(s) - opp_hp(s), so hp_delta = Phi(s_t) -
+        Phi(s_{t-1}), which is guaranteed not to change the optimal policy.
+        An earlier version of this function also added 0.5 * hp_diff, the
+        raw (non-differenced) potential value, on every single step -- that
+        term is not of the policy-invariant form and rewards simply being
+        ahead on HP regardless of whether the turn made progress toward
+        winning, independent of faint_diff/victory_bonus. Removed.
         """
         prior_battle = self._get_prior_battle(battle)
 
         if battle is None:
             return 0.0
 
-   
         ally_hp = np.sum([m.current_hp_fraction for m in battle.team.values()])
         opp_hp = np.sum([m.current_hp_fraction for m in battle.opponent_team.values()])
-        hp_diff = ally_hp - opp_hp
 
         ally_fainted = sum(m.fainted for m in battle.team.values())
         opp_fainted = sum(m.fainted for m in battle.opponent_team.values())
@@ -126,7 +133,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             elif battle.lost:
                 victory_bonus -= 15.0
 
-        reward = 1.0 * hp_delta + 0.5 * hp_diff + faint_diff + victory_bonus
+        reward = 1.0 * hp_delta + faint_diff + victory_bonus
         return float(np.clip(reward, -30.0, 30.0))
 
     # =========================================================
